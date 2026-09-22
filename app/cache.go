@@ -53,6 +53,32 @@ func (t *SSOToken) TimeRemaining() time.Duration {
 	return rem
 }
 
+// RemainingFraction returns the fraction of the token's lifetime remaining,
+// in [0, 1] — 1 if the lifetime can't be determined.
+func (t *SSOToken) RemainingFraction() float64 {
+	received, err := time.Parse(timeFormat, t.ReceivedAt)
+	if err != nil {
+		return 1
+	}
+	exp, err := t.ExpiresTime()
+	if err != nil {
+		return 1
+	}
+	span := exp.Sub(received)
+	if span <= 0 {
+		return 1
+	}
+	f := float64(time.Until(exp)) / float64(span)
+	switch {
+	case f < 0:
+		return 0
+	case f > 1:
+		return 1
+	default:
+		return f
+	}
+}
+
 // CacheDir returns ~/.aws/sso/cache/
 func CacheDir() string {
 	return filepath.Join(homeDir(), ".aws", "sso", "cache")

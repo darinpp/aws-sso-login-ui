@@ -28,17 +28,19 @@ const connectivityCheckInterval = 15 * time.Second
 type SessionStatus struct {
 	State     SessionState
 	Remaining time.Duration
+	Fraction  float64 // fraction of the token's lifetime remaining, in [0, 1]
 	Instance  SSOInstance
 }
 
 // Monitor watches SSO token expiry and attempts renewal.
 type Monitor struct {
-	instances    []SSOInstance
-	statusCh     chan SessionStatus
-	authCh       chan SSOInstance // signals UI to trigger re-auth
-	authInFlight sync.Map         // tracks in-progress auth per StartURL
-	initialDone  chan struct{}    // closed when initial auth completes
-	wg           sync.WaitGroup   // tracks in-flight goroutines for graceful shutdown
+	instances        []SSOInstance
+	statusCh         chan SessionStatus
+	authCh           chan SSOInstance // signals UI to trigger re-auth
+	authInFlight     sync.Map         // tracks in-progress auth per StartURL
+	lastRenewAttempt sync.Map         // per-StartURL time.Time of last proactive renewal attempt
+	initialDone      chan struct{}    // closed when initial auth completes
+	wg               sync.WaitGroup   // tracks in-flight goroutines for graceful shutdown
 }
 
 func NewMonitor(instances []SSOInstance) *Monitor {
@@ -199,6 +201,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			if token != nil && token.RefreshToken != "" {
 				refreshed, err := RefreshToken(ctx, inst, token)
 				if err == nil {
+					m.clearRenewBackoff(inst.StartURL)
 					m.sendStatus(refreshed, inst)
 					continue
 				}
@@ -218,8 +221,49 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			}
 			continue
 		}
+
+		if token.RefreshToken != "" && m.shouldRenew(inst.StartURL, token) {
+			refreshed, err := RefreshToken(ctx, inst, token)
+			if err == nil {
+				m.clearRenewBackoff(inst.StartURL)
+				m.sendStatus(refreshed, inst)
+				continue
+			}
+			log.Printf("proactive renewal failed for %s: %v", inst.StartURL, err)
+			m.lastRenewAttempt.Store(inst.StartURL, time.Now())
+		}
 		m.sendStatus(token, inst)
 	}
+}
+
+// shouldRenew reports whether a still-valid token has one third or less of
+// its lifetime remaining, and the retry backoff (a quarter of the token's
+// lifetime) has elapsed since the last renewal attempt. A successful renewal
+// clears the backoff via clearRenewBackoff, so the next threshold is never
+// throttled — the backoff only gates retries after a failed attempt.
+func (m *Monitor) shouldRenew(startURL string, token *SSOToken) bool {
+	received, err := time.Parse(timeFormat, token.ReceivedAt)
+	if err != nil {
+		return false
+	}
+	exp, err := token.ExpiresTime()
+	if err != nil {
+		return false
+	}
+	span := exp.Sub(received)
+	if span <= 0 {
+		return false
+	}
+	if time.Now().Before(received.Add(span * 2 / 3)) {
+		return false
+	}
+	lastAttempt, _ := m.lastRenewAttempt.Load(startURL)
+	last, _ := lastAttempt.(time.Time)
+	return time.Since(last) >= span/4
+}
+
+func (m *Monitor) clearRenewBackoff(startURL string) {
+	m.lastRenewAttempt.Delete(startURL)
 }
 
 func (m *Monitor) sendStatus(token *SSOToken, inst SSOInstance) {
@@ -235,6 +279,7 @@ func (m *Monitor) sendStatus(token *SSOToken, inst SSOInstance) {
 	case m.statusCh <- SessionStatus{
 		State:     state,
 		Remaining: remaining,
+		Fraction:  token.RemainingFraction(),
 		Instance:  inst,
 	}:
 	default:
