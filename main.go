@@ -24,6 +24,19 @@ func main() {
 		return false
 	}
 
+	switch {
+	case hasFlag("--install"):
+		if err := doInstall(); err != nil {
+			log.Fatalf("install: %v", err)
+		}
+		return
+	case hasFlag("--uninstall"):
+		if err := doUninstall(); err != nil {
+			log.Fatalf("uninstall: %v", err)
+		}
+		return
+	}
+
 	if hasFlag("--test-auth") {
 		testAuth()
 		return
