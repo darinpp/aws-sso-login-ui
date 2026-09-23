@@ -170,11 +170,7 @@ func onReady() {
 					if remaining == 0 {
 						state = StateExpired
 					}
-					span := cachedExpiry.Sub(cachedReceivedAt)
-					fraction := 1.0
-					if span > 0 {
-						fraction = float64(remaining) / float64(span)
-					}
+					fraction := remainingFraction(remaining, cachedExpiry.Sub(cachedReceivedAt))
 					s := SessionStatus{
 						State:     state,
 						Remaining: remaining,

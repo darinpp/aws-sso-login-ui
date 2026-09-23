@@ -64,11 +64,24 @@ func (t *SSOToken) RemainingFraction() float64 {
 	if err != nil {
 		return 1
 	}
-	span := exp.Sub(received)
+	return remainingFraction(time.Until(exp), exp.Sub(received))
+}
+
+// minDisplayTTL floors the span used for the moon-phase icon fraction, so a
+// token issued with a shorter TTL doesn't render as artificially fresh next
+// to its actual absolute remaining time.
+const minDisplayTTL = time.Hour
+
+// remainingFraction returns the fraction of span remaining, in [0, 1] — 1 if
+// span can't be reasoned about — flooring span at minDisplayTTL.
+func remainingFraction(remaining, span time.Duration) float64 {
 	if span <= 0 {
 		return 1
 	}
-	f := float64(time.Until(exp)) / float64(span)
+	if span < minDisplayTTL {
+		span = minDisplayTTL
+	}
+	f := float64(remaining) / float64(span)
 	switch {
 	case f < 0:
 		return 0
