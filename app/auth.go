@@ -12,8 +12,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -28,6 +31,15 @@ const (
 	refreshGrantType = "refresh_token"
 	redirectPath     = "/oauth/callback"
 	ssoScope         = "sso:account:access"
+
+	// interactiveWaitTimeout bounds how long a visible, user-initiated
+	// sign-in waits for the browser redirect. backgroundWaitTimeout bounds
+	// a silent/background attempt far more tightly, so a flow that can't
+	// complete silently (e.g. needs real interactive login) fails fast
+	// instead of leaving a real, visible tab sitting in the browser for
+	// minutes.
+	interactiveWaitTimeout = 5 * time.Minute
+	backgroundWaitTimeout  = 20 * time.Second
 )
 
 // Auth failure reasons — each produces a different UI indicator.
@@ -39,7 +51,7 @@ var (
 // up a loopback callback listener, opens the system browser to the
 // authorization endpoint, catches the redirect, and exchanges the code for a
 // token.
-func Authenticate(ctx context.Context, inst SSOInstance) (*SSOToken, error) {
+func Authenticate(ctx context.Context, inst SSOInstance, background bool) (*SSOToken, error) {
 	setupCtx, setupCancel := context.WithTimeout(ctx, networkTimeout)
 	defer setupCancel()
 
@@ -97,9 +109,15 @@ func Authenticate(ctx context.Context, inst SSOInstance) (*SSOToken, error) {
 	}.Encode()
 
 	log.Printf("Opening browser for authorization (redirect_uri=%s)", redirectURI)
-	openBrowser(authURL)
+	if cleanup := openBrowser(authURL, background); cleanup != nil {
+		defer cleanup()
+	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	waitTimeout := interactiveWaitTimeout
+	if background {
+		waitTimeout = backgroundWaitTimeout
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 
 	var code string
@@ -286,11 +304,120 @@ func searchString(s, substr string) bool {
 	return false
 }
 
-func openBrowser(rawURL string) {
+// openBrowser opens rawURL and, if it launched a process that needs to be
+// torn down afterward (e.g. a disposable headless Chrome instance), returns
+// a cleanup func — nil if there's nothing to clean up. A background open
+// only ever tries the headless, cookie-only method: if that isn't available
+// or fails, it does nothing further, so an automatic renewal attempt can
+// never show a real, visible browser window — only a manual Login click can.
+func openBrowser(rawURL string, background bool) func() {
 	switch runtime.GOOS {
 	case "darwin":
+		if background {
+			return openHeadlessCookieProfile(rawURL)
+		}
 		exec.Command("open", rawURL).Start()
 	case "linux":
 		exec.Command("xdg-open", rawURL).Start()
+	}
+	return nil
+}
+
+// skipHeadlessOnce forces the next openHeadlessCookieProfile call to decline,
+// so a test can exercise the AppleScript/open -g fallback chain instead. It
+// is consumed (reset to false) by that one call.
+var skipHeadlessOnce atomic.Bool
+
+// openHeadlessCookieProfile launches a fully headless Chrome against an
+// isolated, disposable copy of the selected profile's cookies, so the
+// silent authorization redirect can complete without ever creating a
+// visible window. Returns a cleanup func if launched, or nil if this
+// method couldn't be attempted, in which case the caller should fall back
+// to the next method.
+func openHeadlessCookieProfile(rawURL string) func() {
+	if skipHeadlessOnce.Swap(false) {
+		return nil
+	}
+	chromeBin := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+	if _, err := os.Stat(chromeBin); err != nil {
+		return nil
+	}
+	profileDir, err := selectedChromeProfileDir()
+	if err != nil {
+		return nil
+	}
+	srcCookies := filepath.Join(chromeUserDataDir(), profileDir, "Cookies")
+	if _, err := os.Stat(srcCookies); err != nil {
+		return nil
+	}
+
+	tmpProfile, err := os.MkdirTemp("", "aws-sso-login-ui-chrome-")
+	if err != nil {
+		return nil
+	}
+	cleanupDir := func() { os.RemoveAll(tmpProfile) }
+
+	defaultDir := filepath.Join(tmpProfile, "Default")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		cleanupDir()
+		return nil
+	}
+	dstCookies := filepath.Join(defaultDir, "Cookies")
+	backup := exec.Command("sqlite3", srcCookies, fmt.Sprintf(".backup '%s'", dstCookies))
+	if out, err := backup.CombinedOutput(); err != nil {
+		log.Printf("headless cookie profile: sqlite3 backup failed: %v: %s", err, out)
+		cleanupDir()
+		return nil
+	}
+
+	// Strip Google's own session cookies from the copy. Chrome performs
+	// background GAIA account-consistency checks on startup using whatever
+	// Google session cookies a profile holds, independent of what URL is
+	// navigated to. Carrying a copy of them into a second, simultaneously
+	// running Chrome process makes Google's backend see the same session
+	// used from two places at once, which it treats as session theft and
+	// revokes — signing the real browser out of Gmail. These cookies are
+	// never needed for the AWS/Entra SSO flow.
+	filterOut := exec.Command("sqlite3", dstCookies, `DELETE FROM cookies WHERE `+
+		`host_key LIKE '%google.com' OR host_key LIKE '%gmail.com' OR `+
+		`host_key LIKE '%youtube.com' OR host_key LIKE '%googleusercontent.com' OR `+
+		`host_key LIKE '%gstatic.com' OR host_key LIKE '%googleapis.com' OR `+
+		`host_key LIKE '%googlevideo.com' OR host_key LIKE '%doubleclick.net';`)
+	if out, err := filterOut.CombinedOutput(); err != nil {
+		log.Printf("headless cookie profile: filtering Google cookies failed: %v: %s", err, out)
+		cleanupDir()
+		return nil
+	}
+
+	// Launch via "open -a" (Launch Services) rather than exec'ing Chrome's
+	// binary directly — a direct exec trips macOS's App Management privacy
+	// prompt ("prevented from modifying apps"), since it looks like this
+	// process is controlling Chrome's execution rather than a normal,
+	// user-facing app launch. -n forces a new process even though Chrome
+	// (with a different profile) is already running.
+	openArgs := []string{
+		"-a", "Google Chrome",
+		"-n",
+		"--args",
+		"--headless=new",
+		"--user-data-dir=" + tmpProfile,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-extensions",
+		rawURL,
+	}
+	if err := exec.Command("open", openArgs...).Run(); err != nil {
+		log.Printf("headless cookie profile: launch failed: %v", err)
+		cleanupDir()
+		return nil
+	}
+	log.Printf("headless cookie profile: launched against profile %q", profileDir)
+
+	return func() {
+		// The real Chrome process isn't a child of ours (open -a launched
+		// it via Launch Services), so it's found by its unique, disposable
+		// --user-data-dir rather than a held *os.Process.
+		_ = exec.Command("pkill", "-f", tmpProfile).Run()
+		cleanupDir()
 	}
 }

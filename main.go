@@ -105,7 +105,7 @@ func testAuth() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	token, err := app.Authenticate(ctx, inst)
+	token, err := app.Authenticate(ctx, inst, false)
 	if err != nil {
 		log.Fatalf("Authentication FAILED: %v", err)
 	}

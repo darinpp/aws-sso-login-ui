@@ -24,7 +24,7 @@ func TestTriggerAuth_Deduplication(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		mon.TriggerAuth(ctx, inst)
+		mon.TriggerAuth(ctx, inst, false)
 		close(done)
 	}()
 
@@ -63,14 +63,14 @@ func TestTriggerAuth_ConcurrentCalls(t *testing.T) {
 
 	go func() {
 		mon.authInFlight.Delete(inst.StartURL)
-		mon.TriggerAuth(ctx, inst)
+		mon.TriggerAuth(ctx, inst, false)
 		atomic.AddInt32(&authCount, 1)
 		close(done1)
 	}()
 	go func() {
 		// Small delay to let first goroutine claim the lock
 		time.Sleep(10 * time.Millisecond)
-		mon.TriggerAuth(ctx, inst)
+		mon.TriggerAuth(ctx, inst, false)
 		atomic.AddInt32(&authCount, 1)
 		close(done2)
 	}()

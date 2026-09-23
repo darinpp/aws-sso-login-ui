@@ -27,9 +27,13 @@ To remove it: `./aws-sso-login-ui --uninstall` (run from anywhere, using either 
 The menu-bar icon is a moon phase showing how much of the current token's lifetime is left (🌕 fresh → 🌑 about to expire), 🚫 for no session/error, 📡 for offline/retrying. Click it for:
 
 - **Login** — re-authenticate now (opens the browser)
-- **Renew** — manually trigger a silent renewal (test helper)
-- **Force Expire** — mark the current token expired, for testing
+- **Token** — test helpers: **Refresh** (expire the access token, keep the refresh token), **Federation** (expire and invalidate the refresh token, forcing a fresh sign-in), **Remove** (same as Federation, but skips the silent browser method to test the fallback)
+- **Chrome Profile** — choose which Chrome profile silent renewal copies cookies from; defaults to whichever profile Chrome itself would open
 - **Quit**
+
+## Silent renewal
+
+When a session needs to re-authenticate automatically, the app launches a disposable, headless copy of Chrome using an isolated copy of the chosen profile's cookies — nothing ever becomes visible, and the copy is deleted immediately after. This requires Google Chrome and `sqlite3` (bundled with macOS) to be installed. If it's ever unavailable or fails, the app does nothing further automatically and waits for a manual **Login** click.
 
 ## Running without installing
 

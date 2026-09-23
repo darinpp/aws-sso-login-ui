@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -62,8 +61,14 @@ func onReady() {
 	mStatus := mSession.AddSubMenuItem("Loading...", "Session status")
 	mStatus.Disable()
 	mLogin := mSession.AddSubMenuItem("Login", "Re-authenticate SSO")
-	mRenew := mSession.AddSubMenuItem("Renew", "Manually trigger a silent renewal (test helper)")
-	mExpire := mSession.AddSubMenuItem("Force Expire", "Expire current token for testing")
+	mTokenMenu := mSession.AddSubMenuItem("Token", "Token test helpers")
+	mTokenRefresh := mTokenMenu.AddSubMenuItem("Refresh",
+		"Expire access token; refresh token stays valid")
+	mTokenFederation := mTokenMenu.AddSubMenuItem("Federation",
+		"Expire token and invalidate refresh token; re-authenticates via the identity provider")
+	mTokenRemove := mTokenMenu.AddSubMenuItem("Remove",
+		"Expire token and invalidate refresh token")
+	addChromeProfileMenu(mSession)
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Quit aws-sso-login-ui")
 
@@ -95,7 +100,7 @@ func onReady() {
 	if !hasValid {
 		go func() {
 			for _, inst := range instances {
-				mon.TriggerAuth(ctx, inst)
+				mon.TriggerAuth(ctx, inst, false)
 			}
 			mon.InitialAuthDone()
 		}()
@@ -111,6 +116,7 @@ func onReady() {
 	var lastStatus SessionStatus
 	var hasStatus bool
 	var cachedReceivedAt, cachedExpiry time.Time // in-memory token span to avoid disk reads every tick
+	var cachedHasRefresh bool
 	spinnerFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	spinnerIdx := 0
 
@@ -124,32 +130,18 @@ func onReady() {
 					if token, err := LoadToken(status.Instance.StartURL); err == nil {
 						cachedExpiry, _ = token.ExpiresTime()
 						cachedReceivedAt, _ = time.Parse(timeFormat, token.ReceivedAt)
+						cachedHasRefresh = token.RefreshToken != ""
 					}
 				}
 				updateUI(mStatus, &status)
 			case inst := <-mon.AuthCh():
+				lastStatus = SessionStatus{State: StateExpired, Instance: inst}
 				updateExpired(mStatus)
-				go mon.TriggerAuth(ctx, inst)
+				go mon.TriggerAuth(ctx, inst, true)
 			case <-mLogin.ClickedCh:
 				go func() {
 					for _, inst := range instances {
-						mon.TriggerAuth(ctx, inst)
-					}
-				}()
-			case <-mRenew.ClickedCh:
-				go func() {
-					for _, inst := range instances {
-						token, err := LoadToken(inst.StartURL)
-						if err != nil || token.RefreshToken == "" {
-							continue
-						}
-						refreshed, err := RefreshToken(ctx, inst, token)
-						if err != nil {
-							log.Printf("manual renew failed for %s: %v", inst.StartURL, err)
-							continue
-						}
-						mon.clearRenewBackoff(inst.StartURL)
-						mon.sendStatus(refreshed, inst)
+						mon.TriggerAuth(ctx, inst, false)
 					}
 				}()
 			case <-uiTicker.C:
@@ -172,15 +164,16 @@ func onReady() {
 					}
 					fraction := remainingFraction(remaining, cachedExpiry.Sub(cachedReceivedAt))
 					s := SessionStatus{
-						State:     state,
-						Remaining: remaining,
-						Fraction:  fraction,
-						Instance:  lastStatus.Instance,
+						State:           state,
+						Remaining:       remaining,
+						Fraction:        fraction,
+						Instance:        lastStatus.Instance,
+						HasRefreshToken: cachedHasRefresh,
 					}
 					lastStatus = s
 					updateUI(mStatus, &s)
 				}
-			case <-mExpire.ClickedCh:
+			case <-mTokenRefresh.ClickedCh:
 				go func() {
 					for _, inst := range instances {
 						token, err := LoadToken(inst.StartURL)
@@ -188,6 +181,31 @@ func onReady() {
 							continue
 						}
 						token.ExpiresAt = time.Now().UTC().Add(-1 * time.Second).Format(timeFormat)
+						SaveToken(token)
+					}
+				}()
+			case <-mTokenFederation.ClickedCh:
+				go func() {
+					for _, inst := range instances {
+						token, err := LoadToken(inst.StartURL)
+						if err != nil {
+							continue
+						}
+						token.ExpiresAt = time.Now().UTC().Add(-1 * time.Second).Format(timeFormat)
+						token.RefreshToken = "invalid"
+						SaveToken(token)
+					}
+				}()
+			case <-mTokenRemove.ClickedCh:
+				go func() {
+					skipHeadlessOnce.Store(true)
+					for _, inst := range instances {
+						token, err := LoadToken(inst.StartURL)
+						if err != nil {
+							continue
+						}
+						token.ExpiresAt = time.Now().UTC().Add(-1 * time.Second).Format(timeFormat)
+						token.RefreshToken = "invalid"
 						SaveToken(token)
 					}
 				}()
@@ -219,7 +237,11 @@ func updateUI(mStatus *systray.MenuItem, status *SessionStatus) {
 	case StateValid:
 		systray.SetTitle(moonPhase(status.Fraction))
 		systray.SetTooltip(fmt.Sprintf("AWS SSO — %s left", formatDuration(remaining)))
-		mStatus.SetTitle(fmt.Sprintf("Session valid — %s remaining", formatDuration(remaining)))
+		if status.HasRefreshToken {
+			mStatus.SetTitle(fmt.Sprintf("%s left, has refresh token", formatDuration(remaining)))
+		} else {
+			mStatus.SetTitle(fmt.Sprintf("%s left", formatDuration(remaining)))
+		}
 	case StateWarning:
 		systray.SetTitle(moonPhase(status.Fraction))
 		systray.SetTooltip(fmt.Sprintf("Expiring soon — %s left", formatDuration(remaining)))
@@ -263,4 +285,49 @@ func handleQuit(mQuit *systray.MenuItem) {
 		<-mQuit.ClickedCh
 		systray.Quit()
 	}()
+}
+
+// addChromeProfileMenu adds a submenu letting the user override which Chrome
+// profile the silent, headless renewal path copies cookies from — useful
+// when the auto-detected last-used profile isn't the one signed in to Entra.
+func addChromeProfileMenu(parent *systray.MenuItem) {
+	profiles, err := ListChromeProfiles()
+	if err != nil || len(profiles) == 0 {
+		return
+	}
+	override := LoadSettings().ChromeProfile
+
+	autoLabel := "Auto"
+	if defaultDir, err := defaultChromeProfileDir(); err == nil {
+		for _, p := range profiles {
+			if p.Dir == defaultDir {
+				autoLabel = fmt.Sprintf("Auto (%s)", p.Label)
+				break
+			}
+		}
+	}
+
+	mProfile := parent.AddSubMenuItem("Chrome Profile", "Choose which Chrome profile to use for silent renewal")
+	items := make(map[string]*systray.MenuItem, len(profiles)+1)
+	items[""] = mProfile.AddSubMenuItemCheckbox(autoLabel,
+		"Use whichever profile Chrome itself would open", override == "")
+	for _, p := range profiles {
+		item := mProfile.AddSubMenuItemCheckbox(p.Label, p.Dir, p.Dir == override)
+		items[p.Dir] = item
+	}
+	for dir, item := range items {
+		dir, item := dir, item
+		go func() {
+			for range item.ClickedCh {
+				_ = SaveSettings(Settings{ChromeProfile: dir})
+				for d, it := range items {
+					if d == dir {
+						it.Check()
+					} else {
+						it.Uncheck()
+					}
+				}
+			}
+		}()
+	}
 }
