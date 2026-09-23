@@ -40,13 +40,16 @@ var (
 // authorization endpoint, catches the redirect, and exchanges the code for a
 // token.
 func Authenticate(ctx context.Context, inst SSOInstance) (*SSOToken, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(inst.Region))
+	setupCtx, setupCancel := context.WithTimeout(ctx, networkTimeout)
+	defer setupCancel()
+
+	cfg, err := config.LoadDefaultConfig(setupCtx, config.WithRegion(inst.Region))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 	client := ssooidc.NewFromConfig(cfg)
 
-	reg, err := getOrRegisterClient(ctx, client, inst)
+	reg, err := getOrRegisterClient(setupCtx, client, inst)
 	if err != nil {
 		return nil, fmt.Errorf("register client: %w", err)
 	}
@@ -113,7 +116,10 @@ func Authenticate(ctx context.Context, inst SSOInstance) (*SSOToken, error) {
 		code = r.code
 	}
 
-	tokenResp, err := client.CreateToken(ctx, &ssooidc.CreateTokenInput{
+	tokenCtx, tokenCancel := context.WithTimeout(ctx, networkTimeout)
+	defer tokenCancel()
+
+	tokenResp, err := client.CreateToken(tokenCtx, &ssooidc.CreateTokenInput{
 		ClientId:     &reg.ClientID,
 		ClientSecret: &reg.ClientSecret,
 		GrantType:    aws.String(grantType),
@@ -213,6 +219,7 @@ func RefreshToken(ctx context.Context, inst SSOInstance, token *SSOToken) (*SSOT
 	if err := SaveToken(newToken); err != nil {
 		return nil, err
 	}
+	log.Printf("Token refreshed via refresh_token for %s (expires in %ds)", inst.StartURL, tokenResp.ExpiresIn)
 	return newToken, nil
 }
 

@@ -23,6 +23,7 @@ const (
 
 const warningThreshold = 15 * time.Minute
 const connectivityCheckInterval = 15 * time.Second
+const networkTimeout = 30 * time.Second
 
 // SessionStatus is broadcast by the monitor to the UI.
 type SessionStatus struct {
@@ -189,6 +190,15 @@ func (m *Monitor) Run(ctx context.Context) {
 	}
 }
 
+// refreshWithTimeout bounds a single RefreshToken attempt so a hung network
+// call can never block checkAll — and therefore Monitor.Run's ticker loop —
+// indefinitely.
+func refreshWithTimeout(ctx context.Context, inst SSOInstance, token *SSOToken) (*SSOToken, error) {
+	ctx, cancel := context.WithTimeout(ctx, networkTimeout)
+	defer cancel()
+	return RefreshToken(ctx, inst, token)
+}
+
 func (m *Monitor) checkAll(ctx context.Context) {
 	for _, inst := range m.instances {
 		// Skip instances that already have auth in progress
@@ -199,7 +209,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 		token, err := LoadToken(inst.StartURL)
 		if err != nil || token.IsExpired() {
 			if token != nil && token.RefreshToken != "" {
-				refreshed, err := RefreshToken(ctx, inst, token)
+				refreshed, err := refreshWithTimeout(ctx, inst, token)
 				if err == nil {
 					m.clearRenewBackoff(inst.StartURL)
 					m.sendStatus(refreshed, inst)
@@ -223,7 +233,7 @@ func (m *Monitor) checkAll(ctx context.Context) {
 		}
 
 		if token.RefreshToken != "" && m.shouldRenew(inst.StartURL, token) {
-			refreshed, err := RefreshToken(ctx, inst, token)
+			refreshed, err := refreshWithTimeout(ctx, inst, token)
 			if err == nil {
 				m.clearRenewBackoff(inst.StartURL)
 				m.sendStatus(refreshed, inst)
